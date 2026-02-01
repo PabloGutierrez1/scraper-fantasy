@@ -130,7 +130,7 @@ def actualizar_equipo(equipo, conn, cursor):
                 
                 cursor.execute(insert_query, valores)
                 agregados += 1
-                print(f"   ✓ Agregado nuevo: {nombre} ({pos_codigo}) - Dorsal {dorsal}")
+                print(f"Agregado nuevo: {nombre} ({pos_codigo}) - Dorsal {dorsal}")
             except Exception as e:
                 continue
 
@@ -162,57 +162,6 @@ def actualizar_equipo(equipo, conn, cursor):
         conn.rollback()
         return 0, 0, 0
 
-# ==================== INICIO: BORRAR PARA RASPBERRY PI ====================
-# Esta función es solo para modo interactivo (desarrollo/testing)
-# En Raspberry Pi, borra desde aquí hasta el final del comentario "FIN: BORRAR PARA RASPBERRY PI"
-def modo_interactivo():
-    conn = conectar_db()
-    if not conn:
-        print("No se pudo conectar a la base de datos.")
-        return
-    cursor = conn.cursor()
-
-    print("\n" + "="*50)
-    print("MODO INTERACTIVO - ACTUALIZACIÓN DE PLANTILLAS")
-    print("="*50 + "\n")
-
-    while True:
-        print("\nEquipos disponibles:")
-        print("-" * 50)
-        for i, equipo in enumerate(EQUIPOS, 1):
-            print(f"{i}. {equipo['nombre']}")
-        print("0. Salir")
-        print("-" * 50)
-        
-        try:
-            opcion = input("\n¿Qué equipo quieres actualizar? (número): ").strip()
-            
-            if opcion == "0":
-                print("\n¡Hasta luego!")
-                break
-            
-            indice = int(opcion) - 1
-            
-            if indice < 0 or indice >= len(EQUIPOS):
-                print("Opción inválida. Intenta de nuevo.")
-                continue
-            
-            equipo_seleccionado = EQUIPOS[indice]
-            print(f"\n{'='*50}")
-            agregados, omitidos, eliminados = actualizar_equipo(equipo_seleccionado, conn, cursor)
-            print(f"{'='*50}")
-            
-        except ValueError:
-            print("Por favor ingresa un número válido.")
-        except KeyboardInterrupt:
-            print("\n\nInterrumpido por el usuario.")
-            break
-    
-    cursor.close()
-    conn.close()
-    print("\nConexión cerrada. ¡Adiós!")
-# ==================== FIN: BORRAR PARA RASPBERRY PI ====================
-
 def ejecutar_scraper():
     conn = conectar_db()
     if not conn: return
@@ -238,29 +187,4 @@ def ejecutar_scraper():
     print(f"{'='*60}")
 
 if __name__ == "__main__":
-    # ========== RASPBERRY PI: Reemplazar todo este bloque por: ejecutar_scraper() ==========
-    print("\n" + "="*60)
-    print("SINCRONIZADOR DE PLANTILLAS - LIGA FANTASY")
-    print("="*60)
-    print("\n¿Qué modo deseas usar?")
-    print("1. Modo Interactivo (elegir equipos uno por uno)")
-    print("2. Modo Automático (actualizar todos los equipos)")
-    print("="*60)
-    
-    try:
-        modo = input("\nIngresa el número del modo (1 o 2): ").strip()
-        
-        if modo == "1":
-            modo_interactivo()
-        elif modo == "2":
-            ejecutar_scraper()
-        else:
-            print("Opción inválida. Ejecutando modo automático por defecto...\n")
-            ejecutar_scraper()
-    except KeyboardInterrupt:
-        print("\n\nPrograma interrumpido por el usuario. ¡Adiós!")
-    # ========== FIN RASPBERRY PI ==========
-    
-    # PARA RASPBERRY PI, el código debería verse así:
-    # if __name__ == "__main__":
-    #     ejecutar_scraper()
+    ejecutar_scraper()
