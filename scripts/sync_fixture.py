@@ -1,12 +1,11 @@
+import sys
+import os
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import requests
 from bs4 import BeautifulSoup
-import psycopg2
 from datetime import datetime
 import re
-import os
-from dotenv import load_dotenv
-
-load_dotenv()
+from db_config import conectar_db
 
 URL_OFICIAL = "https://www.campeonatochileno.cl/ligas/liga-de-primera-mercado-libre/"
 ANIO_TEMPORADA = 2026
@@ -38,20 +37,6 @@ MAPEO_EQUIPOS = {
     "Universidad de Concepción": "Universidad de Concepcion"
 }
 
-def conectar_db():
-    try:
-        conn = psycopg2.connect(
-            host=os.getenv('DB_HOST'),
-            database=os.getenv('DB_NAME'),
-            user=os.getenv('DB_USER'),
-            password=os.getenv('DB_PASSWORD'),
-            port=os.getenv('DB_PORT', '5432')
-        )
-        return conn
-    except Exception as e:
-        print(f"Error DB: {e}")
-        return None
-
 def parsear_fecha(texto_fecha):
     try:
         texto = texto_fecha.lower().replace("hrs", "").strip()
@@ -74,7 +59,7 @@ def parsear_fecha(texto_fecha):
     return None
 
 def parsear_resultado(texto):
-    match_resultado = re.search(r'(\d+)\s*[-–]\s*(\d+)', texto)
+    match_resultado = re.search(r'(\d+)\s*[-–]?\s*(\d+)', texto)
     if match_resultado:
         goles_local = int(match_resultado.group(1))
         goles_visita = int(match_resultado.group(2))
@@ -149,161 +134,161 @@ def sync_fixture():
     partidos_insertados = 0
     partidos_actualizados = 0
     partidos_sin_cambios = 0
+
+    partidos_html = soup.find_all('div', class_='anwp-fl-game')
+    print(f"Encontrados {len(partidos_html)} partidos en la web...")
     
-    texto_completo = soup.get_text()
-    lineas = texto_completo.split('\n')
-    
-    jornada_actual = JORNADA_INICIO
-    i = 0
-    partidos_procesados = []
-    
-    print(f"Analizando {len(lineas)} lineas...")
-    
-    while i < len(lineas):
-        linea = lineas[i].strip()
+    for partido in partidos_html:
+        equipo_local_elem = partido.find('div', class_='match-slim__team-home-title')
+        equipo_visita_elem = partido.find('div', class_=lambda x: x and 'team-away-title' in str(x) or x and 'team_away' in str(x))
+
+        if not equipo_visita_elem:
+            equipo_visita_elem = partido.find('div', class_='match-slim__team-away-title')
         
-        if re.search(r'^Fecha\s+(\d+)$', linea):
-            match_jornada = re.search(r'^Fecha\s+(\d+)$', linea)
-            if match_jornada:
-                jornada_actual = int(match_jornada.group(1))
-                print(f"\n=== Jornada {jornada_actual} ===")
-                i += 1
+        if not equipo_local_elem or not equipo_visita_elem:
+            continue
+        
+        nombre_local_web = equipo_local_elem.get_text(strip=True)
+        nombre_visita_web = equipo_visita_elem.get_text(strip=True)
+
+        nombre_local = MAPEO_EQUIPOS.get(nombre_local_web)
+        nombre_visita = MAPEO_EQUIPOS.get(nombre_visita_web)
+        
+        if not nombre_local or not nombre_visita:
+            print(f"  Equipos no mapeados: {nombre_local_web} vs {nombre_visita_web}")
+            continue
+
+        fecha_data = partido.get('data-fl-game-datetime')
+        if fecha_data:
+            from datetime import datetime
+            fecha_obj = datetime.fromisoformat(fecha_data.replace('Z', '+00:00'))
+        else:
+            fecha_elem = partido.find('div', class_=lambda x: x and 'date' in str(x).lower())
+            if not fecha_elem:
+                print(f"  Sin fecha: {nombre_local} vs {nombre_visita}")
                 continue
+            
+            fecha_texto = fecha_elem.get_text(strip=True)
+            fecha_obj = parsear_fecha(fecha_texto)
+            if not fecha_obj:
+                print(f"  Error parseando fecha '{fecha_texto}': {nombre_local} vs {nombre_visita}")
+                continue
+
+        score_wrapper = partido.find('div', class_='match-slim__scores-wrapper')
+        goles_local = None
+        goles_visita = None
+        estado = 'programado'
         
-        fecha_match = re.search(r'(\d+)\s+de\s+(enero|febrero|marzo|abril|mayo|junio|julio|agosto|septiembre|octubre|noviembre|diciembre)', linea, re.IGNORECASE)
-        if fecha_match:
-            fecha_texto = linea
-            hora_texto = ""
+        if score_wrapper:
+            score_nums = score_wrapper.find_all('span', class_='match-slim__scores-number')
+            if len(score_nums) >= 2:
+                gol_local_texto = score_nums[0].get_text(strip=True)
+                gol_visita_texto = score_nums[1].get_text(strip=True)
+
+                if gol_local_texto.isdigit() and gol_visita_texto.isdigit():
+                    goles_local = int(gol_local_texto)
+                    goles_visita = int(gol_visita_texto)
+                    estado = 'finalizado'
+
+        try:
+            cursor.execute("SELECT equipo_id FROM equipos WHERE nombre = %s", (nombre_local,))
+            res_local = cursor.fetchone()
+            cursor.execute("SELECT equipo_id FROM equipos WHERE nombre = %s", (nombre_visita,))
+            res_visita = cursor.fetchone()
             
-            for k in range(i+1, min(i+10, len(lineas))):
-                hora_match = re.search(r'(\d+):(\d+)\s+hrs', lineas[k])
-                if hora_match:
-                    hora_texto = lineas[k].strip()
-                    break
+            if not res_local or not res_visita:
+                print(f"  Equipos no encontrados en DB: {nombre_local} o {nombre_visita}")
+                continue
             
-            fecha_completa = f"{fecha_texto} {hora_texto}".strip()
+            equipo_local_id = res_local[0]
+            equipo_visita_id = res_visita[0]
+
+            sql_find = """
+                SELECT p.partido_id, p.jornada_id, j.numero_jornada, p.fecha_partido, 
+                        p.goles_local, p.goles_visita, p.estado 
+                FROM partidos p
+                JOIN jornadas j ON p.jornada_id = j.jornada_id
+                WHERE p.equipo_local_id = %s AND p.equipo_visita_id = %s AND p.temporada_id = %s
+            """
+            cursor.execute(sql_find, (equipo_local_id, equipo_visita_id, TEMPORADA_ID))
+            partido_existente = cursor.fetchone()
             
-            equipos_encontrados = []
-            for j in range(i+1, min(i+30, len(lineas))):
-                linea_check = lineas[j].strip()
+            if partido_existente:
+                partido_id = partido_existente[0]
+                jornada_id = partido_existente[1]
+                numero_jornada = partido_existente[2]
+                fecha_db = partido_existente[3]
+                goles_local_db = partido_existente[4]
+                goles_visita_db = partido_existente[5]
+                estado_db = partido_existente[6]
                 
-                for nombre_web, nombre_db in MAPEO_EQUIPOS.items():
-                    if linea_check == nombre_web:
-                        equipos_encontrados.append(nombre_db)
-                        break
+                cambios = []
                 
-                if len(equipos_encontrados) >= 2:
-                    break
-            
-            if len(equipos_encontrados) >= 2:
-                local = equipos_encontrados[0]
-                visita = equipos_encontrados[1]
+                if fecha_db != fecha_obj:
+                    cambios.append("fecha")
                 
-                partido_key = f"{local}|{visita}"
-                if partido_key in partidos_procesados:
-                    i += 1
-                    continue
+                if goles_local is not None and goles_local_db != goles_local:
+                    cambios.append("goles_local")
                 
-                partidos_procesados.append(partido_key)
+                if goles_visita is not None and goles_visita_db != goles_visita:
+                    cambios.append("goles_visita")
                 
-                fecha_obj = parsear_fecha(fecha_completa)
-                if not fecha_obj:
-                    print(f"  Error parseando fecha: {fecha_completa}")
-                    i += 1
-                    continue
+                if estado != estado_db:
+                    cambios.append("estado")
                 
-                try:
-                    cursor.execute("SELECT equipo_id FROM equipos WHERE nombre = %s", (local,))
-                    res_local = cursor.fetchone()
-                    cursor.execute("SELECT equipo_id FROM equipos WHERE nombre = %s", (visita,))
-                    res_visita = cursor.fetchone()
-                    
-                    if not res_local or not res_visita:
-                        print(f"  Equipos no encontrados en DB: {local} o {visita}")
-                        i += 1
-                        continue
-                    
-                    equipo_local_id = res_local[0]
-                    equipo_visita_id = res_visita[0]
-                    
-                    cursor.execute("SELECT jornada_id FROM jornadas WHERE temporada_id = %s AND numero_jornada = %s", 
-                                 (TEMPORADA_ID, jornada_actual))
-                    res_jornada = cursor.fetchone()
-                    
-                    if not res_jornada:
-                        print(f"  Jornada {jornada_actual} no encontrada en DB")
-                        i += 1
-                        continue
-                    
-                    jornada_id = res_jornada[0]
-                    
-                    sql_find = """
-                        SELECT partido_id, fecha_partido, goles_local, goles_visita, estado 
-                        FROM partidos 
-                        WHERE equipo_local_id = %s AND equipo_visita_id = %s
-                    """
-                    cursor.execute(sql_find, (equipo_local_id, equipo_visita_id))
-                    partido_existente = cursor.fetchone()
-                    
-                    goles_local, goles_visita, estado = None, None, 'programado'
-                    
-                    if partido_existente:
-                        partido_id = partido_existente[0]
-                        fecha_db = partido_existente[1]
-                        goles_local_db = partido_existente[2]
-                        goles_visita_db = partido_existente[3]
-                        estado_db = partido_existente[4]
-                        
-                        cambios = []
-                        
-                        if fecha_db != fecha_obj:
-                            cambios.append("fecha")
-                        
-                        if goles_local is not None and goles_local_db != goles_local:
-                            cambios.append("goles_local")
-                        
-                        if goles_visita is not None and goles_visita_db != goles_visita:
-                            cambios.append("goles_visita")
-                        
-                        if estado != estado_db:
-                            cambios.append("estado")
-                        
-                        if cambios:
-                            if goles_local is not None and goles_visita is not None:
-                                sql_update = """
-                                    UPDATE partidos 
-                                    SET fecha_partido = %s, goles_local = %s, goles_visita = %s, estado = %s
-                                    WHERE partido_id = %s
-                                """
-                                cursor.execute(sql_update, (fecha_obj, goles_local, goles_visita, estado, partido_id))
-                            else:
-                                sql_update = """
-                                    UPDATE partidos 
-                                    SET fecha_partido = %s, estado = %s
-                                    WHERE partido_id = %s
-                                """
-                                cursor.execute(sql_update, (fecha_obj, estado, partido_id))
-                            
-                            print(f"  Actualizado: {local} vs {visita} - {', '.join(cambios)}")
-                            partidos_actualizados += 1
-                        else:
-                            partidos_sin_cambios += 1
-                    else:
-                        sql_insert = """
-                            INSERT INTO partidos 
-                            (jornada_id, equipo_local_id, equipo_visita_id, fecha_partido, goles_local, goles_visita, estado)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s)
+                if cambios:
+                    if goles_local is not None and goles_visita is not None:
+                        sql_update = """
+                            UPDATE partidos 
+                            SET fecha_partido = %s, goles_local = %s, goles_visita = %s, estado = %s
+                            WHERE partido_id = %s
                         """
-                        cursor.execute(sql_insert, (jornada_id, equipo_local_id, equipo_visita_id, 
-                                                   fecha_obj, goles_local, goles_visita, estado))
-                        
-                        print(f"  Insertado: {local} vs {visita} - {fecha_obj.strftime('%d/%m %H:%M')}")
-                        partidos_insertados += 1
+                        cursor.execute(sql_update, (fecha_obj, goles_local, goles_visita, estado, partido_id))
+                    else:
+                        sql_update = """
+                            UPDATE partidos 
+                            SET fecha_partido = %s, estado = %s
+                            WHERE partido_id = %s
+                        """
+                        cursor.execute(sql_update, (fecha_obj, estado, partido_id))
+                    
+                    resultado_msg = f" {goles_local}-{goles_visita}" if goles_local is not None else ""
+                    estado_msg = f" [{estado}]" if estado == 'finalizado' else ""
+                    print(f"  J{numero_jornada} Actualizado: {nombre_local} vs {nombre_visita}{resultado_msg}{estado_msg} - {', '.join(cambios)}")
+                    partidos_actualizados += 1
+                else:
+                    partidos_sin_cambios += 1
+            else:
+                cursor.execute("""
+                    SELECT jornada_id, numero_jornada, fecha_inicio, fecha_fin
+                    FROM jornadas
+                    WHERE temporada_id = %s
+                    ORDER BY ABS(EXTRACT(EPOCH FROM (fecha_inicio - %s)))
+                    LIMIT 1
+                """, (TEMPORADA_ID, fecha_obj))
+                res_jornada = cursor.fetchone()
                 
-                except Exception as e:
-                    print(f"  Error procesando {local} vs {visita}: {e}")
+                if not res_jornada:
+                    print(f"  No se encontró jornada para fecha {fecha_obj}")
+                    continue
+                
+                jornada_id = res_jornada[0]
+                numero_jornada = res_jornada[1]
+                sql_insert = """
+                    INSERT INTO partidos 
+                    (jornada_id, equipo_local_id, equipo_visita_id, fecha_partido, goles_local, goles_visita, estado, temporada_id)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """
+                cursor.execute(sql_insert, (jornada_id, equipo_local_id, equipo_visita_id, 
+                                            fecha_obj, goles_local, goles_visita, estado, TEMPORADA_ID))
+                
+                resultado_msg = f" {goles_local}-{goles_visita}" if goles_local is not None else ""
+                estado_msg = f" [{estado}]" if estado == 'finalizado' else ""
+                print(f"  J{numero_jornada} Insertado: {nombre_local} vs {nombre_visita} - {fecha_obj.strftime('%d/%m %H:%M')}{resultado_msg}{estado_msg}")
+                partidos_insertados += 1
         
-        i += 1
+        except Exception as e:
+            print(f"  Error procesando {nombre_local} vs {nombre_visita}: {e}")
     
     conn.commit()
     conn.close()
