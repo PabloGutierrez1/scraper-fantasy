@@ -2,3 +2,5 @@ requests
 beautifulsoup4
 psycopg2-binary
 python-dotenv
+sshtunnel
+paramiko==2.12.0

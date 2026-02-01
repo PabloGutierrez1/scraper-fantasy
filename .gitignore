@@ -30,6 +30,10 @@ wheels/
 logs/*.log
 logs/*.txt
 
+# Archivos de salida JSON
+output/
+*.json
+
 # IDEs
 .vscode/
 .idea/
