@@ -111,14 +111,25 @@ def actualizar_equipo(equipo, conn, cursor):
                 estado = obtener_estado(fila)
 
                 check_query = """
-                    SELECT 1 FROM jugadores 
+                    SELECT nombre FROM jugadores 
                     WHERE equipo_id = %s AND dorsal = %s
                 """
                 cursor.execute(check_query, (equipo['id_db'], dorsal))
-                existe = cursor.fetchone()
+                resultado = cursor.fetchone()
 
-                if existe:
-                    omitidos += 1
+                if resultado:
+                    nombre_bd = resultado[0]
+                    if nombre_bd != nombre:
+                        update_query = """
+                            UPDATE jugadores 
+                            SET nombre = %s, posicion = %s, estado = %s
+                            WHERE equipo_id = %s AND dorsal = %s
+                        """
+                        cursor.execute(update_query, (nombre, pos_codigo, estado, equipo['id_db'], dorsal))
+                        print(f"Actualizado: {nombre_bd} → {nombre} (Dorsal {dorsal})")
+                        agregados += 1
+                    else:
+                        omitidos += 1
                     continue
 
                 insert_query = """
@@ -132,6 +143,11 @@ def actualizar_equipo(equipo, conn, cursor):
                 agregados += 1
                 print(f"Agregado nuevo: {nombre} ({pos_codigo}) - Dorsal {dorsal}")
             except Exception as e:
+                try:
+                    dorsal_error = obtener_dorsal(fila)
+                    print(f"Error procesando jugador con dorsal {dorsal_error}: {e}")
+                except:
+                    print(f"Error procesando fila (dorsal desconocido): {e}")
                 continue
 
         cursor.execute("""
