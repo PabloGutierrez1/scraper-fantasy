@@ -92,41 +92,45 @@ def actualizar_equipo(equipo, conn, cursor):
             return 0, 0, 0
 
         filas = tabla.find_all('tr', class_=['odd', 'even'])
-        dorsales_actuales = set()
+        nombres_actuales = set()
         agregados = 0
         omitidos = 0
         
         for fila in filas:
             try:
                 dorsal = int(obtener_dorsal(fila))
-                dorsales_actuales.add(dorsal)
                 
                 celda_info = fila.find('td', class_='posrela')
                 tabla_info = celda_info.find('table')
                 trs_info = tabla_info.find_all('tr')
                 
                 nombre = trs_info[0].find('a').text.strip()
+                nombres_actuales.add(nombre)
                 pos_texto = trs_info[1].text.strip()
                 pos_codigo = limpiar_posicion(pos_texto)
                 estado = obtener_estado(fila)
 
                 check_query = """
-                    SELECT nombre FROM jugadores 
-                    WHERE equipo_id = %s AND dorsal = %s
+                    SELECT dorsal, posicion, estado FROM jugadores 
+                    WHERE equipo_id = %s AND nombre = %s
                 """
-                cursor.execute(check_query, (equipo['id_db'], dorsal))
+                cursor.execute(check_query, (equipo['id_db'], nombre))
                 resultado = cursor.fetchone()
 
                 if resultado:
-                    nombre_bd = resultado[0]
-                    if nombre_bd != nombre:
+                    dorsal_bd, pos_bd, estado_bd = resultado
+                    if dorsal_bd != dorsal or pos_bd != pos_codigo or estado_bd != estado:
                         update_query = """
                             UPDATE jugadores 
-                            SET nombre = %s, posicion = %s, estado = %s
-                            WHERE equipo_id = %s AND dorsal = %s
+                            SET dorsal = %s, posicion = %s, estado = %s
+                            WHERE equipo_id = %s AND nombre = %s
                         """
-                        cursor.execute(update_query, (nombre, pos_codigo, estado, equipo['id_db'], dorsal))
-                        print(f"Actualizado: {nombre_bd} → {nombre} (Dorsal {dorsal})")
+                        cursor.execute(update_query, (dorsal, pos_codigo, estado, equipo['id_db'], nombre))
+                        cambios = []
+                        if dorsal_bd != dorsal: cambios.append(f"dorsal {dorsal_bd}→{dorsal}")
+                        if pos_bd != pos_codigo: cambios.append(f"pos {pos_bd}→{pos_codigo}")
+                        if estado_bd != estado: cambios.append(f"estado {estado_bd}→{estado}")
+                        print(f"Actualizado {nombre}: {', '.join(cambios)}")
                         agregados += 1
                     else:
                         omitidos += 1
@@ -151,20 +155,20 @@ def actualizar_equipo(equipo, conn, cursor):
                 continue
 
         cursor.execute("""
-            SELECT dorsal, nombre FROM jugadores 
+            SELECT nombre, dorsal FROM jugadores 
             WHERE equipo_id = %s
         """, (equipo['id_db'],))
         
         jugadores_bd = cursor.fetchall()
         eliminados = 0
         
-        for dorsal_bd, nombre_bd in jugadores_bd:
-            if dorsal_bd not in dorsales_actuales:
+        for nombre_bd, dorsal_bd in jugadores_bd:
+            if nombre_bd not in nombres_actuales:
                 delete_query = """
                     DELETE FROM jugadores 
-                    WHERE equipo_id = %s AND dorsal = %s
+                    WHERE equipo_id = %s AND nombre = %s
                 """
-                cursor.execute(delete_query, (equipo['id_db'], dorsal_bd))
+                cursor.execute(delete_query, (equipo['id_db'], nombre_bd))
                 eliminados += 1
                 print(f"Eliminado (ya no en plantilla): {nombre_bd} - Dorsal {dorsal_bd}")
         
@@ -183,7 +187,7 @@ def ejecutar_scraper():
     if not conn: return
     cursor = conn.cursor()
 
-    print(f"--- INICIANDO ACTUALIZACIÓN DE PLANTILLAS (TODOS LOS EQUIPOS) ---\n")
+    print(f"--- INICIANDO ACTUALIZACIÓN DE PLANTILLAS ---\n")
 
     total_agregados = 0
     total_omitidos = 0
