@@ -77,6 +77,19 @@ def obtener_estado(fila):
                 return 'suspendido'
     return 'activo'
 
+
+def marcar_transferido_en_otras_plantillas(cursor, nombre, equipo_id):
+    """Marca como transferido cualquier fila activa de ese jugador en otros equipos."""
+    cursor.execute(
+        """
+        UPDATE jugadores
+        SET estado = 'transferido', precio_actual = 0
+        WHERE nombre = %s AND equipo_id != %s AND estado != 'transferido'
+        """,
+        (nombre, equipo_id)
+    )
+    return cursor.rowcount
+
 def actualizar_equipo(equipo, conn, cursor):
     print(f"Verificando: {equipo['nombre']}...")
     try:
@@ -146,6 +159,9 @@ def actualizar_equipo(equipo, conn, cursor):
                 cursor.execute(insert_query, valores)
                 agregados += 1
                 print(f"Agregado nuevo: {nombre} ({pos_codigo}) - Dorsal {dorsal}")
+                transferidos_otros = marcar_transferido_en_otras_plantillas(cursor, nombre, equipo['id_db'])
+                if transferidos_otros:
+                    print(f"  -> {nombre}: marcado como transferido en {transferidos_otros} equipo(s) anterior(es)")
             except Exception as e:
                 try:
                     dorsal_error = obtener_dorsal(fila)
@@ -160,22 +176,25 @@ def actualizar_equipo(equipo, conn, cursor):
         """, (equipo['id_db'],))
         
         jugadores_bd = cursor.fetchall()
-        eliminados = 0
+        transferidos = 0
         
         for nombre_bd, dorsal_bd in jugadores_bd:
             if nombre_bd not in nombres_actuales:
-                delete_query = """
-                    DELETE FROM jugadores 
-                    WHERE equipo_id = %s AND nombre = %s
-                """
-                cursor.execute(delete_query, (equipo['id_db'], nombre_bd))
-                eliminados += 1
-                print(f"Eliminado (ya no en plantilla): {nombre_bd} - Dorsal {dorsal_bd}")
+                cursor.execute("""
+                    UPDATE jugadores 
+                    SET 
+                        estado = 'transferido',
+                        precio_actual = 0
+                    WHERE equipo_id = %s AND nombre = %s AND estado != 'transferido'
+                """, (equipo['id_db'], nombre_bd))
+                if cursor.rowcount:
+                    transferidos += 1
+                    print(f"Transferido (ya no en plantilla): {nombre_bd} - Dorsal {dorsal_bd}")
         
         conn.commit() 
-        print(f"Reporte {equipo['nombre']}: {agregados} nuevos, {omitidos} existentes, {eliminados} eliminados.")
+        print(f"Reporte {equipo['nombre']}: {agregados} nuevos, {omitidos} existentes, {transferidos} transferidos.")
         time.sleep(random.uniform(2, 4))
-        return agregados, omitidos, eliminados
+        return agregados, omitidos, transferidos
 
     except Exception as e:
         print(f"Error con equipo {equipo['nombre']}: {e}")
@@ -191,19 +210,19 @@ def ejecutar_scraper():
 
     total_agregados = 0
     total_omitidos = 0
-    total_eliminados = 0
+    total_transferidos = 0
 
     for equipo in EQUIPOS:
-        agregados, omitidos, eliminados = actualizar_equipo(equipo, conn, cursor)
+        agregados, omitidos, transferidos = actualizar_equipo(equipo, conn, cursor)
         total_agregados += agregados
         total_omitidos += omitidos
-        total_eliminados += eliminados
+        total_transferidos += transferidos
 
     cursor.close()
     conn.close()
     print(f"\n{'='*60}")
     print("ACTUALIZACIÓN COMPLETADA")
-    print(f"Total agregados: {total_agregados} | Total existentes: {total_omitidos} | Total eliminados: {total_eliminados}")
+    print(f"Total agregados: {total_agregados} | Total existentes: {total_omitidos} | Total transferidos: {total_transferidos}")
     print(f"{'='*60}")
 
 if __name__ == "__main__":

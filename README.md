@@ -43,8 +43,8 @@ scraper-fantasy/
 - scripts/sync_plantillas.py
   - Toma cada equipo de la liga chilena y raspa su plantilla en Transfermarkt.
   - Convierte posiciones a códigos internos (POR, MI, DC, etc.), obtiene dorsales y detecta estados (activo, lesionado, suspendido).
-  - Inserta jugadores nuevos, actualiza dorsales/posiciones/estado y elimina los que ya no aparecen en Transfermarkt.
-  - Imprime un reporte por equipo con agregados, omitidos y eliminados.
+  - Inserta jugadores nuevos, actualiza dorsales/posiciones/estado y marca como transferidos a los que desaparecieron de Transfermarkt.
+  - Imprime un reporte por equipo con agregados, omitidos y transferidos.
 
 - scripts/sync_estados.py
   - Lee nuevamente las plantillas para detectar lesiones o sanciones por dorsal.
