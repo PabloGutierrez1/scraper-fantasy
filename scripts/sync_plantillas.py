@@ -79,7 +79,6 @@ def obtener_estado(fila):
 
 
 def marcar_transferido_en_otras_plantillas(cursor, nombre, equipo_id):
-    """Marca como transferido cualquier fila activa de ese jugador en otros equipos."""
     cursor.execute(
         """
         UPDATE jugadores
@@ -89,6 +88,223 @@ def marcar_transferido_en_otras_plantillas(cursor, nombre, equipo_id):
         (nombre, equipo_id)
     )
     return cursor.rowcount
+
+
+def reasignar_referencias_jugador(cursor, jugador_id_origen, jugador_id_destino):
+    cursor.execute(
+        """
+        DELETE FROM estadisticas_partido dup
+        USING estadisticas_partido can
+        WHERE dup.jugador_id = %s
+          AND can.jugador_id = %s
+          AND dup.partido_id = can.partido_id
+        """,
+        (jugador_id_origen, jugador_id_destino)
+    )
+    cursor.execute(
+        """
+        UPDATE estadisticas_partido
+        SET jugador_id = %s
+        WHERE jugador_id = %s
+        """,
+        (jugador_id_destino, jugador_id_origen)
+    )
+
+    cursor.execute(
+        """
+        DELETE FROM jugadores_alineacion dup
+        USING jugadores_alineacion can
+        WHERE dup.jugador_id = %s
+          AND can.jugador_id = %s
+          AND dup.alineacion_jornada_id = can.alineacion_jornada_id
+        """,
+        (jugador_id_origen, jugador_id_destino)
+    )
+    cursor.execute(
+        """
+        UPDATE jugadores_alineacion
+        SET jugador_id = %s
+        WHERE jugador_id = %s
+        """,
+        (jugador_id_destino, jugador_id_origen)
+    )
+
+    cursor.execute(
+        """
+        UPDATE plantilla_fantasy
+        SET jugador_id = %s
+        WHERE jugador_id = %s
+        """,
+        (jugador_id_destino, jugador_id_origen)
+    )
+    cursor.execute(
+        """
+        UPDATE resumen_temporada
+        SET jugador_id = %s
+        WHERE jugador_id = %s
+        """,
+        (jugador_id_destino, jugador_id_origen)
+    )
+    cursor.execute(
+        """
+        UPDATE tienda_diaria
+        SET jugador_id = %s
+        WHERE jugador_id = %s
+        """,
+        (jugador_id_destino, jugador_id_origen)
+    )
+
+    cursor.execute(
+        """
+        DELETE FROM jugadores
+        WHERE jugador_id = %s
+        """,
+        (jugador_id_origen,)
+    )
+
+
+def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado):
+    cursor.execute(
+        """
+        SELECT
+            j.jugador_id,
+            j.equipo_id,
+            j.dorsal,
+            j.posicion,
+            j.estado,
+            j.precio_actual,
+            COALESCE(owners.total, 0) AS owners
+        FROM jugadores j
+        LEFT JOIN (
+            SELECT jugador_id, COUNT(*) AS total
+            FROM plantilla_fantasy
+            GROUP BY jugador_id
+        ) owners ON owners.jugador_id = j.jugador_id
+        WHERE j.nombre = %s
+        ORDER BY COALESCE(owners.total, 0) DESC, j.jugador_id ASC
+        """,
+        (nombre,)
+    )
+
+    filas = cursor.fetchall()
+    if not filas:
+        insert_query = """
+            INSERT INTO jugadores
+            (equipo_id, nombre, posicion, dorsal, precio_actual, tier, estado, foto_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """
+        cursor.execute(insert_query, (equipo_id, nombre, pos_codigo, dorsal, 10000000, 'B', estado, None))
+        return 'insertado', [f"nuevo jugador en equipo {equipo_id}"]
+
+    jugador_id_canonico, equipo_bd, dorsal_bd, pos_bd, estado_bd, precio_bd, _owners = filas[0]
+    for fila in filas[1:]:
+        jugador_id_duplicado = fila[0]
+        reasignar_referencias_jugador(cursor, jugador_id_duplicado, jugador_id_canonico)
+
+    precio_nuevo = precio_bd if precio_bd and precio_bd > 0 else 10000000
+    cursor.execute(
+        """
+        UPDATE jugadores
+        SET equipo_id = %s,
+            dorsal = %s,
+            posicion = %s,
+            estado = %s,
+            precio_actual = %s
+        WHERE jugador_id = %s
+        """,
+        (equipo_id, dorsal, pos_codigo, estado, precio_nuevo, jugador_id_canonico)
+    )
+
+    cambios = []
+    if equipo_bd != equipo_id:
+        cambios.append(f"equipo {equipo_bd}→{equipo_id}")
+    if dorsal_bd != dorsal:
+        cambios.append(f"dorsal {dorsal_bd}→{dorsal}")
+    if pos_bd != pos_codigo:
+        cambios.append(f"pos {pos_bd}→{pos_codigo}")
+    if estado_bd != estado:
+        cambios.append(f"estado {estado_bd}→{estado}")
+    if len(filas) > 1:
+        cambios.append(f"duplicados fusionados: {len(filas) - 1}")
+
+    if cambios:
+        return 'actualizado', cambios
+    return 'omitido', []
+
+
+def consolidar_duplicados_historicos(cursor):
+    cursor.execute(
+        """
+        SELECT nombre
+        FROM jugadores
+        GROUP BY nombre
+        HAVING COUNT(*) > 1
+        ORDER BY nombre
+        """
+    )
+    nombres_duplicados = [fila[0] for fila in cursor.fetchall()]
+    if not nombres_duplicados:
+        return 0
+
+    duplicados_fusionados = 0
+    for nombre in nombres_duplicados:
+        cursor.execute(
+            """
+            SELECT
+                j.jugador_id,
+                j.equipo_id,
+                j.dorsal,
+                j.posicion,
+                j.estado,
+                j.precio_actual,
+                COALESCE(owners.total, 0) AS owners
+            FROM jugadores j
+            LEFT JOIN (
+                SELECT jugador_id, COUNT(*) AS total
+                FROM plantilla_fantasy
+                GROUP BY jugador_id
+            ) owners ON owners.jugador_id = j.jugador_id
+            WHERE j.nombre = %s
+            ORDER BY COALESCE(owners.total, 0) DESC, j.jugador_id ASC
+            """,
+            (nombre,)
+        )
+        filas = cursor.fetchall()
+
+        fila_canonica = filas[0]
+        jugador_id_canonico = fila_canonica[0]
+
+        fila_datos = sorted(
+            filas,
+            key=lambda f: (f[4] != 'transferido', f[0]),
+            reverse=True
+        )[0]
+
+        for fila in filas[1:]:
+            jugador_id_duplicado = fila[0]
+            reasignar_referencias_jugador(cursor, jugador_id_duplicado, jugador_id_canonico)
+            duplicados_fusionados += 1
+
+        precio_canonico = fila_canonica[5]
+        precio_datos = fila_datos[5]
+        precio_final = precio_datos if precio_datos and precio_datos > 0 else precio_canonico
+        if not precio_final or precio_final <= 0:
+            precio_final = 10000000
+
+        cursor.execute(
+            """
+            UPDATE jugadores
+            SET equipo_id = %s,
+                dorsal = %s,
+                posicion = %s,
+                estado = %s,
+                precio_actual = %s
+            WHERE jugador_id = %s
+            """,
+            (fila_datos[1], fila_datos[2], fila_datos[3], fila_datos[4], precio_final, jugador_id_canonico)
+        )
+
+    return duplicados_fusionados
 
 def actualizar_equipo(equipo, conn, cursor):
     print(f"Verificando: {equipo['nombre']}...")
@@ -123,42 +339,24 @@ def actualizar_equipo(equipo, conn, cursor):
                 pos_codigo = limpiar_posicion(pos_texto)
                 estado = obtener_estado(fila)
 
-                check_query = """
-                    SELECT dorsal, posicion, estado FROM jugadores 
-                    WHERE equipo_id = %s AND nombre = %s
-                """
-                cursor.execute(check_query, (equipo['id_db'], nombre))
-                resultado = cursor.fetchone()
+                accion, cambios = upsert_jugador_unico(
+                    cursor,
+                    equipo['id_db'],
+                    nombre,
+                    dorsal,
+                    pos_codigo,
+                    estado
+                )
 
-                if resultado:
-                    dorsal_bd, pos_bd, estado_bd = resultado
-                    if dorsal_bd != dorsal or pos_bd != pos_codigo or estado_bd != estado:
-                        update_query = """
-                            UPDATE jugadores 
-                            SET dorsal = %s, posicion = %s, estado = %s
-                            WHERE equipo_id = %s AND nombre = %s
-                        """
-                        cursor.execute(update_query, (dorsal, pos_codigo, estado, equipo['id_db'], nombre))
-                        cambios = []
-                        if dorsal_bd != dorsal: cambios.append(f"dorsal {dorsal_bd}→{dorsal}")
-                        if pos_bd != pos_codigo: cambios.append(f"pos {pos_bd}→{pos_codigo}")
-                        if estado_bd != estado: cambios.append(f"estado {estado_bd}→{estado}")
-                        print(f"Actualizado {nombre}: {', '.join(cambios)}")
-                        agregados += 1
-                    else:
-                        omitidos += 1
-                    continue
+                if accion == 'insertado':
+                    agregados += 1
+                    print(f"Agregado nuevo: {nombre} ({pos_codigo}) - Dorsal {dorsal}")
+                elif accion == 'actualizado':
+                    agregados += 1
+                    print(f"Actualizado {nombre}: {', '.join(cambios)}")
+                else:
+                    omitidos += 1
 
-                insert_query = """
-                    INSERT INTO jugadores 
-                    (equipo_id, nombre, posicion, dorsal, precio_actual, tier, estado, foto_url)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """
-                valores = (equipo['id_db'], nombre, pos_codigo, dorsal, 10000000, 'B', estado, None)
-                
-                cursor.execute(insert_query, valores)
-                agregados += 1
-                print(f"Agregado nuevo: {nombre} ({pos_codigo}) - Dorsal {dorsal}")
                 transferidos_otros = marcar_transferido_en_otras_plantillas(cursor, nombre, equipo['id_db'])
                 if transferidos_otros:
                     print(f"  -> {nombre}: marcado como transferido en {transferidos_otros} equipo(s) anterior(es)")
@@ -205,6 +403,11 @@ def ejecutar_scraper():
     conn = conectar_db()
     if not conn: return
     cursor = conn.cursor()
+
+    duplicados_fusionados = consolidar_duplicados_historicos(cursor)
+    if duplicados_fusionados:
+        conn.commit()
+        print(f"Se fusionaron {duplicados_fusionados} registros duplicados históricos antes del scraping.")
 
     print(f"--- INICIANDO ACTUALIZACIÓN DE PLANTILLAS ---\n")
 
