@@ -55,26 +55,69 @@ def obtener_dorsal(fila):
         if match: return match.group()
     return '0'
 
-LIGA_KEYWORDS = ('liga de primera', 'primera división', 'campeonato nacional', 'liga chilena', 'liga profesional')
-def es_suspension_de_liga(titulo):
-    texto = (titulo or '').lower()
-    return any(keyword in texto for keyword in LIGA_KEYWORDS)
+LESION_KEYWORDS = ('lesi', 'baja', 'enfermo', 'cirug', 'desgarro', 'rotura', 'fractura')
+RED_CARD_KEYWORDS = ('tarjeta roja', 'red card', 'expulsado', 'expulsion')
+DOUBLE_YELLOW_KEYWORDS = ('doble amarilla', 'segunda amarilla', '2 amarilla', 'two yellow', 'segunda amarilla')
+COMPETICIONES_EXTERNAS = ('copa chile', 'copa de la liga', 'libertadores', 'sudamericana', 'supercopa', 'recopa', 'amistoso', 'conmebol', 'ucl')
+
+
+def _texto_estado_elemento(elemento):
+    partes = []
+    for attr in ('title', 'data-original-title', 'data-tippy-content', 'aria-label', 'alt'):
+        valor = elemento.get(attr)
+        if valor:
+            partes.append(valor.lower())
+
+    titulo_svg = elemento.find('title')
+    if titulo_svg and titulo_svg.text:
+        partes.append(titulo_svg.text.lower())
+
+    return ' '.join(partes)
+
+
+def _es_sancion_liga_primera(texto_estado):
+    """Verifica que la sanción sea de Liga de Primera (no de otras competiciones)"""
+    texto_lower = texto_estado.lower()
+    
+    # Si menciona una competición externa, no es de Liga de Primera
+    for competicion in COMPETICIONES_EXTERNAS:
+        if competicion in texto_lower:
+            return False
+    
+    # Si no menciona competición externa, asumir que es Liga de Primera
+    return True
+
 
 def obtener_estado(fila):
-    celda = fila.find('td', class_='posrela')
-    if not celda: return 'activo'
-    avisos = celda.find_all('span', class_='icons_sprite')
-    for aviso in avisos:
-        clases = aviso.get('class', [])
-        titulo = aviso.get('title', '').lower()
-        if 'verletzt-table' in clases: return 'lesionado'
-        if any(w in titulo for w in ['lesi', 'baja', 'enfermo', 'cirug', 'desgarro']): return 'lesionado'
+    if not fila:
+        return 'activo'
 
-        if ('roja' in titulo or 'sanci' in titulo or 'suspen' in titulo):
-            competencias_externas = ['copa chile', 'libertadores', 'sudamericana', 'supercopa', 'recopa', 'amistoso']
-            es_externa = any(comp in titulo for comp in competencias_externas)
-            if not es_externa:
+    lesion_detectada = False
+    for elemento in fila.find_all(True):
+        clases = ' '.join(elemento.get('class', [])).lower()
+        texto_estado = _texto_estado_elemento(elemento)
+
+        if 'verletzt-table' in clases or any(palabra in texto_estado for palabra in LESION_KEYWORDS):
+            lesion_detectada = True
+
+        # Detección de sanciones: buscar específicamente tarjeta roja o doble amarilla
+        if 'gesperrt-table' in clases:
+            if _es_sancion_liga_primera(texto_estado):
                 return 'suspendido'
+
+        # Buscar palabras clave de tarjeta roja (más específicas que solo "roja")
+        if any(palabra in texto_estado for palabra in RED_CARD_KEYWORDS):
+            if _es_sancion_liga_primera(texto_estado):
+                return 'suspendido'
+
+        # Buscar palabras clave de doble amarilla
+        if any(palabra in texto_estado for palabra in DOUBLE_YELLOW_KEYWORDS):
+            if _es_sancion_liga_primera(texto_estado):
+                return 'suspendido'
+
+    if lesion_detectada:
+        return 'lesionado'
+
     return 'activo'
 
 
