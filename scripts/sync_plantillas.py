@@ -6,6 +6,7 @@ from bs4 import BeautifulSoup
 import time
 import random
 import re
+from datetime import date
 from db_config import conectar_db
 
 HEADERS = {
@@ -54,6 +55,20 @@ def obtener_dorsal(fila):
         match = re.search(r'\d+', td_num.text.strip())
         if match: return match.group()
     return '0'
+
+
+def obtener_fecha_nacimiento(fila):
+    tds = fila.find_all('td')
+    if len(tds) > 5:
+        texto = tds[5].get_text(' ', strip=True)
+        match = re.search(r'(\d{2})/(\d{2})/(\d{4})', texto)
+        if match:
+            dia, mes, anio = map(int, match.groups())
+            try:
+                return date(anio, mes, dia)
+            except ValueError:
+                return None
+    return None
 
 LESION_KEYWORDS = ('lesi', 'baja', 'enfermo', 'cirug', 'desgarro', 'rotura', 'fractura')
 RED_CARD_KEYWORDS = ('tarjeta roja', 'red card', 'expulsado', 'expulsion')
@@ -121,15 +136,33 @@ def obtener_estado(fila):
     return 'activo'
 
 
-def marcar_transferido_en_otras_plantillas(cursor, nombre, equipo_id):
-    cursor.execute(
-        """
-        UPDATE jugadores
-        SET estado = 'transferido', precio_actual = 0
-        WHERE nombre = %s AND equipo_id != %s AND estado != 'transferido'
-        """,
-        (nombre, equipo_id)
-    )
+def marcar_transferido_en_otras_plantillas(cursor, nombre, fecha_nacimiento, jugador_id, equipo_id):
+    if fecha_nacimiento is not None:
+        cursor.execute(
+            """
+            UPDATE jugadores
+            SET estado = 'transferido', precio_actual = 0
+            WHERE nombre = %s
+              AND fecha_nacimiento = %s
+              AND jugador_id != %s
+              AND equipo_id != %s
+              AND estado != 'transferido'
+            """,
+            (nombre, fecha_nacimiento, jugador_id, equipo_id)
+        )
+    else:
+        cursor.execute(
+            """
+            UPDATE jugadores
+            SET estado = 'transferido', precio_actual = 0
+            WHERE nombre = %s
+              AND fecha_nacimiento IS NULL
+              AND jugador_id != %s
+              AND equipo_id != %s
+              AND estado != 'transferido'
+            """,
+            (nombre, jugador_id, equipo_id)
+        )
     return cursor.rowcount
 
 
@@ -206,9 +239,8 @@ def reasignar_referencias_jugador(cursor, jugador_id_origen, jugador_id_destino)
     )
 
 
-def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado):
-    cursor.execute(
-        """
+def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado, fecha_nacimiento):
+    select_sql = """
         SELECT
             j.jugador_id,
             j.equipo_id,
@@ -216,6 +248,7 @@ def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado):
             j.posicion,
             j.estado,
             j.precio_actual,
+            j.fecha_nacimiento,
             COALESCE(owners.total, 0) AS owners
         FROM jugadores j
         LEFT JOIN (
@@ -223,23 +256,49 @@ def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado):
             FROM plantilla_fantasy
             GROUP BY jugador_id
         ) owners ON owners.jugador_id = j.jugador_id
-        WHERE j.nombre = %s
+        WHERE {condicion}
         ORDER BY COALESCE(owners.total, 0) DESC, j.jugador_id ASC
-        """,
-        (nombre,)
-    )
+    """
 
-    filas = cursor.fetchall()
+    # 1) Identidad confirmada por (nombre + fecha de nacimiento)
+    if fecha_nacimiento is not None:
+        cursor.execute(
+            select_sql.format(condicion="j.nombre = %s AND j.fecha_nacimiento = %s"),
+            (nombre, fecha_nacimiento)
+        )
+        filas = cursor.fetchall()
+
+        # 2) Sin match: adoptar fila legacy sin fecha (migración de datos)
+        if not filas:
+            cursor.execute(
+                select_sql.format(condicion="j.nombre = %s AND j.fecha_nacimiento IS NULL"),
+                (nombre,)
+            )
+            filas = cursor.fetchall()
+    else:
+        # Sin fecha disponible: solo matchear filas legacy sin fecha.
+        # Nunca tocar una fila que ya tenga fecha (podría ser un homónimo).
+        cursor.execute(
+            select_sql.format(condicion="j.nombre = %s AND j.fecha_nacimiento IS NULL"),
+            (nombre,)
+        )
+        filas = cursor.fetchall()
+
     if not filas:
         insert_query = """
             INSERT INTO jugadores
-            (equipo_id, nombre, posicion, dorsal, precio_actual, tier, estado, foto_url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            (equipo_id, nombre, posicion, dorsal, precio_actual, tier, estado, foto_url, fecha_nacimiento)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            RETURNING jugador_id
         """
-        cursor.execute(insert_query, (equipo_id, nombre, pos_codigo, dorsal, 10000000, 'B', estado, None))
-        return 'insertado', [f"nuevo jugador en equipo {equipo_id}"]
+        cursor.execute(
+            insert_query,
+            (equipo_id, nombre, pos_codigo, dorsal, 10000000, 'B', estado, None, fecha_nacimiento)
+        )
+        nuevo_id = cursor.fetchone()[0]
+        return 'insertado', nuevo_id, [f"nuevo jugador en equipo {equipo_id}"]
 
-    jugador_id_canonico, equipo_bd, dorsal_bd, pos_bd, estado_bd, precio_bd, _owners = filas[0]
+    jugador_id_canonico, equipo_bd, dorsal_bd, pos_bd, estado_bd, precio_bd, fecha_bd, _owners = filas[0]
     for fila in filas[1:]:
         jugador_id_duplicado = fila[0]
         reasignar_referencias_jugador(cursor, jugador_id_duplicado, jugador_id_canonico)
@@ -252,10 +311,11 @@ def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado):
             dorsal = %s,
             posicion = %s,
             estado = %s,
-            precio_actual = %s
+            precio_actual = %s,
+            fecha_nacimiento = %s
         WHERE jugador_id = %s
         """,
-        (equipo_id, dorsal, pos_codigo, estado, precio_nuevo, jugador_id_canonico)
+        (equipo_id, dorsal, pos_codigo, estado, precio_nuevo, fecha_nacimiento, jugador_id_canonico)
     )
 
     cambios = []
@@ -267,32 +327,33 @@ def upsert_jugador_unico(cursor, equipo_id, nombre, dorsal, pos_codigo, estado):
         cambios.append(f"pos {pos_bd}→{pos_codigo}")
     if estado_bd != estado:
         cambios.append(f"estado {estado_bd}→{estado}")
+    if fecha_bd != fecha_nacimiento:
+        cambios.append(f"fecha nacimiento {fecha_bd}→{fecha_nacimiento}")
     if len(filas) > 1:
         cambios.append(f"duplicados fusionados: {len(filas) - 1}")
 
     if cambios:
-        return 'actualizado', cambios
-    return 'omitido', []
+        return 'actualizado', jugador_id_canonico, cambios
+    return 'omitido', jugador_id_canonico, []
 
 
 def consolidar_duplicados_historicos(cursor):
     cursor.execute(
         """
-        SELECT nombre
+        SELECT nombre, COALESCE(fecha_nacimiento::text, '')
         FROM jugadores
-        GROUP BY nombre
+        GROUP BY nombre, COALESCE(fecha_nacimiento::text, '')
         HAVING COUNT(*) > 1
         ORDER BY nombre
         """
     )
-    nombres_duplicados = [fila[0] for fila in cursor.fetchall()]
-    if not nombres_duplicados:
+    grupos = cursor.fetchall()
+    if not grupos:
         return 0
 
     duplicados_fusionados = 0
-    for nombre in nombres_duplicados:
-        cursor.execute(
-            """
+    for nombre, fecha_texto in grupos:
+        select_sql = """
             SELECT
                 j.jugador_id,
                 j.equipo_id,
@@ -300,6 +361,7 @@ def consolidar_duplicados_historicos(cursor):
                 j.posicion,
                 j.estado,
                 j.precio_actual,
+                j.fecha_nacimiento,
                 COALESCE(owners.total, 0) AS owners
             FROM jugadores j
             LEFT JOIN (
@@ -307,12 +369,22 @@ def consolidar_duplicados_historicos(cursor):
                 FROM plantilla_fantasy
                 GROUP BY jugador_id
             ) owners ON owners.jugador_id = j.jugador_id
-            WHERE j.nombre = %s
+            WHERE j.nombre = %s AND {condicion_fecha}
             ORDER BY COALESCE(owners.total, 0) DESC, j.jugador_id ASC
-            """,
-            (nombre,)
-        )
+        """
+        if fecha_texto:
+            cursor.execute(
+                select_sql.format(condicion_fecha="j.fecha_nacimiento = %s"),
+                (nombre, fecha_texto)
+            )
+        else:
+            cursor.execute(
+                select_sql.format(condicion_fecha="j.fecha_nacimiento IS NULL"),
+                (nombre,)
+            )
         filas = cursor.fetchall()
+        if len(filas) < 2:
+            continue
 
         fila_canonica = filas[0]
         jugador_id_canonico = fila_canonica[0]
@@ -349,6 +421,24 @@ def consolidar_duplicados_historicos(cursor):
 
     return duplicados_fusionados
 
+
+def reportar_colisiones_nombre(cursor):
+    cursor.execute(
+        """
+        SELECT nombre, COUNT(DISTINCT COALESCE(fecha_nacimiento::text, ''))
+        FROM jugadores
+        GROUP BY nombre
+        HAVING COUNT(DISTINCT COALESCE(fecha_nacimiento::text, '')) > 1
+        ORDER BY nombre
+        """
+    )
+    colisiones = cursor.fetchall()
+    if colisiones:
+        print("Colisiones de nombre detectadas (mismo nombre, distinta fecha de nacimiento):")
+        for nombre, n_fechas in colisiones:
+            print(f"  - '{nombre}': {n_fechas} fechas de nacimiento distintas -> revisar manualmente")
+    return len(colisiones)
+
 def actualizar_equipo(equipo, conn, cursor):
     print(f"Verificando: {equipo['nombre']}...")
     try:
@@ -381,14 +471,16 @@ def actualizar_equipo(equipo, conn, cursor):
                 pos_texto = trs_info[1].text.strip()
                 pos_codigo = limpiar_posicion(pos_texto)
                 estado = obtener_estado(fila)
+                fecha_nacimiento = obtener_fecha_nacimiento(fila)
 
-                accion, cambios = upsert_jugador_unico(
+                accion, jugador_id, cambios = upsert_jugador_unico(
                     cursor,
                     equipo['id_db'],
                     nombre,
                     dorsal,
                     pos_codigo,
-                    estado
+                    estado,
+                    fecha_nacimiento
                 )
 
                 if accion == 'insertado':
@@ -400,7 +492,7 @@ def actualizar_equipo(equipo, conn, cursor):
                 else:
                     omitidos += 1
 
-                transferidos_otros = marcar_transferido_en_otras_plantillas(cursor, nombre, equipo['id_db'])
+                transferidos_otros = marcar_transferido_en_otras_plantillas(cursor, nombre, fecha_nacimiento, jugador_id, equipo['id_db'])
                 if transferidos_otros:
                     print(f"  -> {nombre}: marcado como transferido en {transferidos_otros} equipo(s) anterior(es)")
             except Exception as e:
@@ -451,6 +543,8 @@ def ejecutar_scraper():
     if duplicados_fusionados:
         conn.commit()
         print(f"Se fusionaron {duplicados_fusionados} registros duplicados históricos antes del scraping.")
+
+    reportar_colisiones_nombre(cursor)
 
     print(f"--- INICIANDO ACTUALIZACIÓN DE PLANTILLAS ---\n")
 
